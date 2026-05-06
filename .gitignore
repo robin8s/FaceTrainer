@@ -347,3 +347,7 @@ healthchecksdb
 
 # Backup folder for Package Reference Convert tool in Visual Studio 2017
 MigrationBackup/
+
+# FaceTrainer generated training images
+FaceTrainer/TrainingData/**
+!FaceTrainer/TrainingData/data.txt
