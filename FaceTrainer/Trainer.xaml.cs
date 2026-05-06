@@ -1,22 +1,19 @@
 ﻿using Emgu.CV;
+using Emgu.CV.CvEnum;
 using Emgu.CV.Structure;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Text;
-using System.Threading.Tasks;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Data;
-using System.Windows.Documents;
-using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
-using System.Windows.Navigation;
-using System.Windows.Shapes;
 
 namespace FaceTrainer
 {
@@ -25,15 +22,19 @@ namespace FaceTrainer
     /// </summary>
     public partial class Trainer : Page
     {
-        private String savePath = "";
-        private CascadeClassifier classifier;
+        private const int TrainingImageSize = 224;
+        private const double FacePaddingPercent = 0.35;
+        private const int MinimumFaceSize = 80;
+
+        private string savePath = string.Empty;
+        private readonly CascadeClassifier classifier;
         public CameraMode camera = null;
         public BitmapSource modified_image = null;
-        private List<BitmapImage> emoji;
-        private Stopwatch watch;
+        private readonly List<BitmapImage> emoji;
+        private readonly Stopwatch watch;
 
-        private int msPerEmoji = 2000;
-        private int msBetweenSaves = 333;
+        private readonly int msPerEmoji = 2000;
+        private readonly int msBetweenSaves = 333;
         private bool saveReady = false;
         private long lastElapsedMs = 0;
         private int saveImageNumber = 0;
@@ -44,27 +45,28 @@ namespace FaceTrainer
         {
             InitializeComponent();
 
-            classifier = new CascadeClassifier(System.Windows.Forms.Application.StartupPath + "/haarcascade_frontalface_alt_tree.xml");
+            string baseDirectory = AppContext.BaseDirectory;
+            classifier = new CascadeClassifier(Path.Combine(baseDirectory, "haarcascade_frontalface_alt_tree.xml"));
             watch = new Stopwatch();
             emoji = new List<BitmapImage>();
 
-            List<string> filePathList = Directory.GetFiles(System.Windows.Forms.Application.StartupPath + @"\Emoji\").ToList();
-            foreach (string filePath in filePathList)
+            foreach (string filePath in Directory.GetFiles(Path.Combine(baseDirectory, "Emoji")))
             {
                 emoji.Add(new BitmapImage(new Uri(filePath)));
             }
 
             if (camera == null)
             {
-                /* initialize the cameramode object and pass it the event handler */
                 camera = new CameraMode(timer_Tick);
             }
-            
         }
 
-        public void Start(String prefix)
+        public void Start(string prefix)
         {
-            this.savePath = System.Windows.Forms.Application.StartupPath + @"\TrainingData\" + prefix + "\\";
+            string projectDirectory = ResolveProjectDirectory();
+            string sanitizedPrefix = SanitizePrefix(prefix);
+            savePath = Path.Combine(projectDirectory, "TrainingData", sanitizedPrefix);
+
             camera.startTimer();
             btnStart.IsEnabled = true;
             saveReady = false;
@@ -81,7 +83,32 @@ namespace FaceTrainer
             saveImageNumber = 0;
         }
 
-        /* The threaded function that takes care of the drawing of rectangles. */
+        private string ResolveProjectDirectory()
+        {
+            DirectoryInfo current = new DirectoryInfo(AppContext.BaseDirectory);
+            while (current != null)
+            {
+                bool hasProjectFile = File.Exists(Path.Combine(current.FullName, "FaceTrainer.csproj"));
+                bool hasTrainingData = Directory.Exists(Path.Combine(current.FullName, "TrainingData"));
+                if (hasProjectFile || hasTrainingData)
+                {
+                    return current.FullName;
+                }
+
+                current = current.Parent;
+            }
+
+            return Environment.CurrentDirectory;
+        }
+
+        private static string SanitizePrefix(string prefix)
+        {
+            string value = (prefix ?? string.Empty).Trim();
+            value = Regex.Replace(value, "[^A-Za-z0-9_\\- ]", "_");
+            value = value.Trim();
+            return string.IsNullOrWhiteSpace(value) ? "UnknownUser" : value;
+        }
+
         private void timer_Tick(object sender, EventArgs e)
         {
             long elapsed = watch.ElapsedMilliseconds;
@@ -90,154 +117,182 @@ namespace FaceTrainer
             {
                 saveReady = true;
             }
+
             if (elapsed > msPerEmoji * emoji.Count)
             {
                 Stop();
-
-                if (TrainingCompleted != null)
-                    TrainingCompleted(this, EventArgs.Empty);
+                TrainingCompleted?.Invoke(this, EventArgs.Empty);
             }
 
             progressTrainer.Value = (double)Math.Min(elapsed, msPerEmoji * emoji.Count) / (msPerEmoji * emoji.Count + 1) * 100;
             progressTrainer.UpdateLayout();
 
-            /* Grab a frame from the camera */
-            Image<Bgr, Byte> currentFrame = camera.queryFrame();
-
-            /* Check to see that there was a frame collected */
-            if (currentFrame != null)
+            using (Image<Bgr, byte> currentFrame = camera.queryFrame())
             {
-                detectFaces(currentFrame);
-                currentFrame.Dispose();
+                if (currentFrame != null)
+                {
+                    detectFaces(currentFrame);
+                }
+            }
+        }
+
+        private int currentEmoji()
+        {
+            return (int)Math.Min(emoji.Count - 1, watch.ElapsedMilliseconds / msPerEmoji);
+        }
+
+        private Rectangle[] DetectFaces(Image<Gray, byte> grayFrame)
+        {
+            return classifier.DetectMultiScale(grayFrame, 1.04, 5, System.Drawing.Size.Empty);
+        }
+
+        private Rectangle? SelectBestFace(Rectangle[] faces)
+        {
+            return faces
+                .Where(face => face.Width >= MinimumFaceSize && face.Height >= MinimumFaceSize)
+                .OrderByDescending(face => face.Width * face.Height)
+                .Cast<Rectangle?>()
+                .FirstOrDefault();
+        }
+
+        private Rectangle? BuildSquareCrop(Rectangle face, int imageWidth, int imageHeight)
+        {
+            int centerX = face.X + face.Width / 2;
+            int centerY = face.Y + face.Height / 2;
+
+            double sideWithPadding = Math.Max(face.Width, face.Height) * (1 + FacePaddingPercent * 2);
+            int side = (int)Math.Round(sideWithPadding);
+            side = Math.Min(side, Math.Min(imageWidth, imageHeight));
+
+            if (side <= 0)
+            {
+                return null;
             }
 
+            int x = centerX - side / 2;
+            int y = centerY - side / 2;
 
-            //GC.Collect();
-        }
+            x = Math.Max(0, Math.Min(x, imageWidth - side));
+            y = Math.Max(0, Math.Min(y, imageHeight - side));
 
-        private int currentEmoji ()
-        {
-            return (int)Math.Min(emoji.Count-1, (watch.ElapsedMilliseconds / msPerEmoji));
-        }
-
-        /* Save the image with the specified name */
-        public void saveImage(BitmapSource source)
-        {
-            saveImageNumber++;
-            String filename = savePath + "image" + saveImageNumber.ToString().PadLeft(3, '0') + ".png";
-
-            if (!Directory.Exists(savePath))
-                Directory.CreateDirectory(savePath);
-
-            FileStream stream = new FileStream(filename, FileMode.Create);
-            PngBitmapEncoder encoder = new PngBitmapEncoder();
-            encoder.Interlace = PngInterlaceOption.Off;
-            // see notes below about BitmapFrame.Create()
-            encoder.Frames.Add(BitmapFrame.Create(source));
-            encoder.Save(stream);
-            stream.Close();
-        }
-
-        private void detectFaces(Image<Bgr, Byte> image)
-        {
-            /* Check to see that there was a frame collected */
-            if (image != null)
+            if (x < 0 || y < 0 || x + side > imageWidth || y + side > imageHeight)
             {
+                return null;
+            }
 
-                /* convert the frame from the camera to a transformed Image that improves facial detection */
-                Image<Gray, Byte> grayFrame = image.Convert<Gray, Byte>();
+            return new Rectangle(x, y, side, side);
+        }
 
-                /* Detect how many faces are there on the image */
-                if (saveReady)
+        private Image<Bgr, byte> CropAndResizeFace(Image<Bgr, byte> frame, Rectangle face)
+        {
+            Rectangle? cropArea = BuildSquareCrop(face, frame.Width, frame.Height);
+            if (cropArea == null)
+            {
+                return null;
+            }
+
+            using (Image<Bgr, byte> cropped = frame.Copy(cropArea.Value))
+            {
+                return cropped.Resize(TrainingImageSize, TrainingImageSize, Inter.Cubic);
+            }
+        }
+
+        private bool TrySaveTrainingFace(Image<Bgr, byte> frame)
+        {
+            using (Image<Gray, byte> grayFrame = frame.Convert<Gray, byte>())
+            {
+                Rectangle[] faces = DetectFaces(grayFrame);
+                Rectangle? bestFace = SelectBestFace(faces);
+                if (bestFace == null)
+                {
+                    return false;
+                }
+
+                using (Image<Bgr, byte> resizedFace = CropAndResizeFace(frame, bestFace.Value))
+                {
+                    if (resizedFace == null)
+                    {
+                        return false;
+                    }
+
+                    if (!Directory.Exists(savePath))
+                    {
+                        Directory.CreateDirectory(savePath);
+                    }
+
+                    int nextImageNumber = saveImageNumber + 1;
+                    string filename = Path.Combine(savePath, $"image{nextImageNumber:000}.png");
+                    resizedFace.Save(filename);
+                    saveImageNumber = nextImageNumber;
+                    return true;
+                }
+            }
+        }
+
+        private void detectFaces(Image<Bgr, byte> image)
+        {
+            if (image == null)
+            {
+                return;
+            }
+
+            using (Image<Gray, byte> grayFrame = image.Convert<Gray, byte>())
+            {
+                Rectangle[] detectedFaces = DetectFaces(grayFrame);
+
+                if (saveReady && watch.IsRunning)
                 {
                     saveReady = false;
-                    lastElapsedMs = watch.ElapsedMilliseconds;
-                    saveImage(ToBitmapSource(image));
+                    if (TrySaveTrainingFace(image))
+                    {
+                        lastElapsedMs = watch.ElapsedMilliseconds;
+                    }
                 }
 
-                if (!watch.IsRunning)
+                foreach (Rectangle face in detectedFaces)
                 {
-                    var detectedFaces = classifier.DetectMultiScale(grayFrame, 1.04, 5, System.Drawing.Size.Empty);
-
-                    // loop through all faces that were detected and draw a rectangle 
-                    foreach (var face in detectedFaces)
-                    {
-                        int paddingX = (int)(face.Width * .4);
-                        int paddingY = (int)(face.Height * .4);
-
-                        image.Draw(new System.Drawing.Rectangle(face.X - paddingX, face.Y - paddingY, face.Width + paddingX * 2, face.Height + paddingY * 2), new Bgr(System.Drawing.Color.Blue), 3);
-                    }
-
-                    if (detectedFaces.Length == 0)
-                    {
-                        grayFrame = grayFrame.Rotate(20, new Gray(0));
-                        detectedFaces = classifier.DetectMultiScale(grayFrame, 1.1, 5, System.Drawing.Size.Empty);
-
-                        // loop through all faces that were detected and draw a rectangle 
-                        foreach (var face in detectedFaces)
-                        {
-                            int paddingX = (int)(face.Width * .4);
-                            int paddingY = (int)(face.Height * .4);
-
-                            image.Draw(new System.Drawing.Rectangle(face.X - paddingX, face.Y - paddingY, face.Width + paddingX * 2, face.Height + paddingY * 2), new Bgr(System.Drawing.Color.DarkGreen), 3);
-                        }
-                    }
-
+                    int paddingX = (int)(face.Width * .4);
+                    int paddingY = (int)(face.Height * .4);
+                    image.Draw(new Rectangle(face.X - paddingX, face.Y - paddingY, face.Width + paddingX * 2, face.Height + paddingY * 2), new Bgr(System.Drawing.Color.Blue), 3);
                 }
+            }
 
-                modified_image = ToBitmapSource(image);
+            modified_image = ToBitmapSource(image);
 
+            FormattedText text = new FormattedText("", new CultureInfo("en-us"), FlowDirection.LeftToRight,
+                new Typeface(this.FontFamily, FontStyles.Normal, FontWeights.Normal, new FontStretch()), this.FontSize,
+                this.Foreground, VisualTreeHelper.GetDpi(this).PixelsPerDip);
 
-
-                FormattedText text = new FormattedText("",
-                                 new System.Globalization.CultureInfo("en-us"),
-                                 System.Windows.FlowDirection.LeftToRight,
-                                 new Typeface(this.FontFamily, FontStyles.Normal, FontWeights.Normal, new FontStretch()),
-                                 this.FontSize,
-                                 this.Foreground);
-
-                DrawingVisual drawingVisual = new DrawingVisual();
-                DrawingContext drawingContext = drawingVisual.RenderOpen();
+            DrawingVisual drawingVisual = new DrawingVisual();
+            using (DrawingContext drawingContext = drawingVisual.RenderOpen())
+            {
                 drawingContext.DrawImage(modified_image, new Rect(0, 0, modified_image.PixelWidth, modified_image.PixelHeight));
                 drawingContext.PushOpacity(0.45);
 
                 int eindex = currentEmoji();
-                drawingContext.DrawImage(emoji[eindex], new Rect(0 + (imgCamera.Width-emoji[eindex].PixelWidth)/2, 0, emoji[eindex].PixelWidth, emoji[eindex].PixelHeight));
-                drawingContext.DrawText(text, new Point(2, 2));
-                drawingContext.Close();
-
-                RenderTargetBitmap bmp = new RenderTargetBitmap(modified_image.PixelWidth, modified_image.PixelHeight, modified_image.DpiX, modified_image.DpiY, PixelFormats.Pbgra32);
-                bmp.Render(drawingVisual);
-
-
-                /* set the transformed image to the image1 object */
-                imgCamera.Source = bmp;
+                drawingContext.DrawImage(emoji[eindex], new Rect((imgCamera.Width - emoji[eindex].PixelWidth) / 2, 0, emoji[eindex].PixelWidth, emoji[eindex].PixelHeight));
+                drawingContext.DrawText(text, new System.Windows.Point(2, 2));
             }
+
+            RenderTargetBitmap bmp = new RenderTargetBitmap(modified_image.PixelWidth, modified_image.PixelHeight,
+                modified_image.DpiX, modified_image.DpiY, PixelFormats.Pbgra32);
+            bmp.Render(drawingVisual);
+
+            imgCamera.Source = bmp;
         }
 
         [DllImport("gdi32")]
         private static extern int DeleteObject(IntPtr o);
 
-        /* Function to convert an IImage to a BitmapSource. This is needed because
-         * otherwise I have to use a hardcoded ImageBox object that is defined in EmguCV
-         * but this will hault my design so I decided to convert the Image object to the proper
-         * format to use a normal Image object that is used in WPF
-         */
-        public static BitmapSource ToBitmapSource(IImage image)
+        public static BitmapSource ToBitmapSource(Image<Bgr, byte> image)
         {
-            using (System.Drawing.Bitmap source = image.Bitmap)
+            using (System.Drawing.Bitmap source = image.Mat.ToBitmap())
             {
-                IntPtr ptr = source.GetHbitmap(); /* obtain the Hbitmap */
-
-                /* Transform the IImage to a BitmapSource */
+                IntPtr ptr = source.GetHbitmap();
                 BitmapSource bs = System.Windows.Interop.Imaging.CreateBitmapSourceFromHBitmap(
-                    ptr,
-                    IntPtr.Zero,
-                    Int32Rect.Empty,
-                    System.Windows.Media.Imaging.BitmapSizeOptions.FromEmptyOptions());
-
-                DeleteObject(ptr); /* release the HBitmap */
-                return bs; /* return the newly converted BitmapSource */
+                    ptr, IntPtr.Zero, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
+                DeleteObject(ptr);
+                return bs;
             }
         }
 
