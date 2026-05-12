@@ -46,7 +46,7 @@ namespace FaceTrainer
             InitializeComponent();
 
             string baseDirectory = AppContext.BaseDirectory;
-            classifier = new CascadeClassifier(Path.Combine(baseDirectory, "haarcascade_frontalface_alt_tree.xml"));
+            classifier = new CascadeClassifier(Path.Combine(baseDirectory, "haarcascade_frontalface_default.xml"));
             watch = new Stopwatch();
             emoji = new List<BitmapImage>();
 
@@ -185,6 +185,8 @@ namespace FaceTrainer
 
         private Image<Bgr, byte> CropAndResizeFace(Image<Bgr, byte> frame, Rectangle face)
         {
+            const int FaceSize = 224;
+            const double MatchThreshold = 45;
             Rectangle? cropArea = BuildSquareCrop(face, frame.Width, frame.Height);
             if (cropArea == null)
             {
